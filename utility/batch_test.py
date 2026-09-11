@@ -112,14 +112,14 @@ def test_one_user(x):
 def test_torch(ua_embeddings, ia_embeddings, users_to_test, is_val, drop_flag=False, batch_test_flag=False):
     result = {'precision': np.zeros(len(Ks)), 'recall': np.zeros(len(Ks)), 'ndcg': np.zeros(len(Ks)),
               'hit_ratio': np.zeros(len(Ks)), 'auc': 0.}
-    pool = multiprocessing.Pool(cores)
+    # Serial evaluation avoids spawning processes that reload the dataset on macOS.
 
-    u_batch_size = BATCH_SIZE * 2
+    u_batch_size = args.eval_batch_size
     i_batch_size = BATCH_SIZE
 
-    test_users = users_to_test
+    test_users = users_to_test[:args.eval_users] if args.eval_users else users_to_test
     n_test_users = len(test_users)
-    n_user_batchs = n_test_users // u_batch_size + 1
+    n_user_batchs = (n_test_users + u_batch_size - 1) // u_batch_size
     count = 0
 
     for u_batch_id in range(n_user_batchs):
@@ -154,8 +154,8 @@ def test_torch(ua_embeddings, ia_embeddings, users_to_test, is_val, drop_flag=Fa
         rate_batch = rate_batch.detach().cpu().numpy()
         user_batch_rating_uid = zip(rate_batch, user_batch, [is_val] * len(user_batch))
 
-        batch_result = pool.map(test_one_user, user_batch_rating_uid)
-        count += len(batch_result)
+        batch_result = map(test_one_user, user_batch_rating_uid)
+        count += len(user_batch)
 
         for re in batch_result:
             result['precision'] += re['precision'] / n_test_users
@@ -165,5 +165,5 @@ def test_torch(ua_embeddings, ia_embeddings, users_to_test, is_val, drop_flag=Fa
             result['auc'] += re['auc'] / n_test_users
 
     assert count == n_test_users
-    pool.close()
+
     return result

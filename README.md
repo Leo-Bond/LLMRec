@@ -59,6 +59,62 @@ pip install -r requirements.txt
 ```
 
 
+## Local CPU training (including Apple Silicon Macs)
+
+The root training entrypoint supports `--device cpu` and `--device cuda`.
+The default `--device auto` selects CUDA if available, otherwise CPU. Apple
+MPS is not enabled for this sparse graph implementation.
+
+Use the Python environment containing PyTorch (`python` and `python3` may
+refer to different environments). For a fresh CPU environment, the training
+entrypoint only needs `pip install -r requirements-cpu.txt`; the original
+`requirements.txt` includes the authors' broader CUDA-era environment.
+
+Place these files directly in `data/netflix/`:
+
+```text
+train.json, val.json, test.json, train_mat
+image_feat.npy, text_feat.npy
+augmented_sample_dict
+augmented_user_init_embedding
+augmented_atttribute_embedding_dict
+```
+
+The spelling `atttribute` is intentional. User and item IDs must match the
+matrix rows/columns and feature rows. Attribute names are read from the data,
+so the directory can be named `netflix`. Downloaded files are not rewritten.
+Logs are created automatically under `logs/`.
+
+Run a short end-to-end check using the full graph, one training batch, and
+32 users from each evaluation split:
+
+```bash
+python main.py --dataset netflix --device cpu --epoch 1 --batch_size 64 --max_batches 1 --eval_users 32
+```
+
+Run one complete epoch (all training batches and evaluation users):
+
+```bash
+python main.py --dataset netflix --device cpu --epoch 1
+```
+
+Run training with early stopping:
+
+```bash
+python main.py --dataset netflix --device cpu
+```
+
+`--num_threads` defaults to 4; `--eval_batch_size` defaults to 128 to limit
+score-matrix memory. `--max_batches` and `--eval_users` default to 0 (no limit).
+Limited smoke-test metrics are not experiment results. Evaluation is serial
+to avoid macOS worker processes reloading the dataset. Early stopping uses
+validation Recall at the second configured K (20 by default); test metrics
+are recorded when validation improves. Model checkpoints are not saved.
+
+The original loss pruning order and reciprocal embedding regularizer are
+retained. The optional attribute-mask/reconstruction branch remains experimental;
+the commands above use its original disabled defaults.
+
 <h2>Usage </h2>
 
 <h4>Stage 1: LLM-based Data Augmentation</h4>
@@ -285,4 +341,3 @@ If you find this work helpful to your research, please kindly consider citing ou
 ## Acknowledgement
 
 The structure of this code is largely based on [MMSSL](https://github.com/HKUDS/MMSSL), [LATTICE](https://github.com/CRIPAC-DIG/LATTICE), [MICRO](https://github.com/CRIPAC-DIG/MICRO). Thank them for their work.
-

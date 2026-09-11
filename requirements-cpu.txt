@@ -1,0 +1,7 @@
+# Minimal dependencies for the root recommender training entrypoint.
+# LLM augmentation scripts and baseline projects have separate requirements.
+numpy
+scipy
+torch
+scikit-learn
+tqdm

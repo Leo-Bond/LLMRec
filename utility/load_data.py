@@ -18,7 +18,7 @@ class Data(object):
 
         #get number of users and items
         self.n_users, self.n_items = 0, 0
-        self.n_train, self.n_test = 0, 0
+        self.n_train, self.n_test, self.n_val = 0, 0, 0
         self.neg_pools = {}
 
         self.exist_users = []
@@ -155,7 +155,7 @@ class Data(object):
 
 
     def sample(self):
-        if self.batch_size <= self.n_users:
+        if self.batch_size <= len(self.exist_users):
             users = rd.sample(self.exist_users, self.batch_size)
         else:
             users = [rd.choice(self.exist_users) for _ in range(self.batch_size)]

@@ -53,4 +53,18 @@ def parse_args():
     parser.add_argument('--aug_sample_rate', type=float, default=0.1, help='Augmentation sample rate')
     parser.add_argument('--mf_emb_rate', type=float, default=0.0, help='MF embedding rate')
 
-    return parser.parse_args()
+    parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto',
+                        help='auto uses CUDA when available, otherwise CPU; sparse MPS is not enabled')
+    parser.add_argument('--num_threads', type=int, default=4, help='CPU threads for PyTorch')
+    parser.add_argument('--max_batches', type=int, default=0, help='Limit batches per epoch for a smoke test; 0 means all')
+    parser.add_argument('--eval_users', type=int, default=0, help='Limit evaluation users for a smoke test; 0 means all')
+    parser.add_argument('--eval_batch_size', type=int, default=128, help='Evaluation users per score matrix')
+    args = parser.parse_args()
+    args.data_path = args.data_path.rstrip('/') + '/'
+    if args.epoch < 1 or args.batch_size < 1 or args.num_threads < 1 or args.eval_batch_size < 1:
+        parser.error('epoch, batch_size, num_threads and eval_batch_size must be positive')
+    if args.max_batches < 0 or args.eval_users < 0:
+        parser.error('max_batches and eval_users must be nonnegative')
+    if not 0 <= args.prune_loss_drop_rate < 1 or not 0 <= args.aug_sample_rate <= 1:
+        parser.error('prune_loss_drop_rate must be in [0, 1); aug_sample_rate in [0, 1]')
+    return args

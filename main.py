@@ -20,8 +20,7 @@ import random
 
 import copy
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 from utility.parser import parse_args
 from Models import MM_Model, Decoder  
@@ -29,9 +28,12 @@ from utility.batch_test import *
 from utility.logging import Logger
 from utility.norm import build_sim, build_knn_normalized_graph
 
-import setproctitle
 
 args = parse_args()
+if args.device == 'cuda' and not torch.cuda.is_available():
+    raise RuntimeError('CUDA is unavailable. Use --device cpu on this Mac.')
+device = torch.device(f'cuda:{args.gpu_id}' if args.device != 'cpu' and torch.cuda.is_available() else 'cpu')
+torch.set_num_threads(args.num_threads)
 
 
 class Trainer(object):
@@ -41,6 +43,7 @@ class Trainer(object):
         self.logger = Logger(filename=self.task_name, is_debug=args.debug)
         self.logger.logging("PID: %d" % os.getpid())
         self.logger.logging(str(args))
+        self.logger.logging(f"Device: {device}")
 
         self.mess_dropout = eval(args.mess_dropout)
         self.lr = args.lr
@@ -57,26 +60,53 @@ class Trainer(object):
         self.text_feat_dim = self.text_feats.shape[-1]
 
         self.ui_graph = self.ui_graph_raw = pickle.load(open(args.data_path + args.dataset + '/train_mat','rb'))
-        # get user embedding  
-        augmented_user_init_embedding = pickle.load(open(args.data_path + args.dataset + '/augmented_user_init_embedding','rb'))
-        augmented_user_init_embedding_list = []
-        for i in range(len(augmented_user_init_embedding)):
-            augmented_user_init_embedding_list.append(augmented_user_init_embedding[i])
-        augmented_user_init_embedding_final = np.array(augmented_user_init_embedding_list)
-        pickle.dump(augmented_user_init_embedding_final, open(args.data_path + args.dataset + '/augmented_user_init_embedding_final','wb'))
-        self.user_init_embedding = pickle.load(open(args.data_path + args.dataset + '/augmented_user_init_embedding_final','rb'))
-        # get separate embedding matrix 
-        if args.dataset=='preprocessed_raw_MovieLens':
-            augmented_total_embed_dict = {'title':[] , 'genre':[], 'director':[], 'country':[], 'language':[]}   
-        elif args.dataset=='netflix_valid_item':
-            augmented_total_embed_dict = {'year':[] , 'title':[], 'director':[], 'country':[], 'language':[]}   
-        augmented_atttribute_embedding_dict = pickle.load(open(args.data_path + args.dataset + '/augmented_atttribute_embedding_dict','rb'))
-        for value in augmented_atttribute_embedding_dict.keys():
-            for i in range(len(augmented_atttribute_embedding_dict[value])):
-                augmented_total_embed_dict[value].append(augmented_atttribute_embedding_dict[value][i])   
-            augmented_total_embed_dict[value] = np.array(augmented_total_embed_dict[value])    
-        pickle.dump(augmented_total_embed_dict, open(args.data_path + args.dataset + '/augmented_total_embed_dict','wb'))
-        self.item_attribute_embedding = pickle.load(open(args.data_path + args.dataset + '/augmented_total_embed_dict','rb'))       
+        # Build float32 matrices in ID order without rewriting downloaded files.
+        def load_embeddings(name):
+            with open(args.data_path + args.dataset + '/' + name, 'rb') as handle:
+                return pickle.load(handle)
+
+        def as_matrix(values, count, label):
+            if isinstance(values, dict):
+                try:
+                    matrix = np.asarray([values[i] for i in range(count)], dtype=np.float32)
+                except KeyError as exc:
+                    raise ValueError(f'{label}: missing integer ID {exc}') from exc
+                if len(values) != count:
+                    raise ValueError(f'{label}: expected {count} entries, got {len(values)}')
+            else:
+                matrix = np.asarray(values, dtype=np.float32)
+            if matrix.ndim != 2 or matrix.shape[0] != count or not np.isfinite(matrix).all():
+                raise ValueError(f'{label}: invalid embedding matrix {matrix.shape}')
+            return matrix
+
+        n_users, n_items = self.ui_graph.shape
+        if (n_users, n_items) != (data_config['n_users'], data_config['n_items']):
+            raise ValueError('train_mat dimensions do not match the interaction dataset')
+        self.user_init_embedding = as_matrix(
+            load_embeddings('augmented_user_init_embedding'), n_users, 'user profiles')
+        attributes = load_embeddings('augmented_atttribute_embedding_dict')
+        self.item_attribute_embedding = {}
+        # Pop each attribute after conversion to release the large Python lists.
+        for key in list(attributes):
+            self.item_attribute_embedding[key] = as_matrix(attributes.pop(key), n_items, key)
+        if 'title' not in self.item_attribute_embedding:
+            raise ValueError('Item attributes must include title')
+        if len({value.shape[1] for value in self.item_attribute_embedding.values()}) != 1:
+            raise ValueError('All item attributes must have the same embedding dimension')
+        for name, features in [('image', self.image_feats), ('text', self.text_feats)]:
+            if features.ndim != 2 or features.shape[0] != n_items:
+                raise ValueError(f'{name} feature rows do not match train_mat')
+        self.augmented_samples = {}
+        if args.aug_sample_rate:
+            raw_samples = load_embeddings('augmented_sample_dict')
+            for user, pair in raw_samples.items():
+                try:
+                    user, positive, negative = int(user), int(pair[0]), int(pair[1])
+                except (ValueError, TypeError, KeyError, IndexError):
+                    continue
+                if 0 <= user < n_users and 0 <= positive < n_items and 0 <= negative < n_items and positive != negative:
+                    self.augmented_samples[user] = (positive, negative)
+            self.logger.logging(f'Valid augmented sample pairs: {len(self.augmented_samples)}')
 
         self.image_ui_index = {'x':[], 'y':[]}
         self.text_ui_index = {'x':[], 'y':[]}
@@ -92,9 +122,9 @@ class Trainer(object):
         self.image_ui_graph = self.text_ui_graph = self.ui_graph
         self.image_iu_graph = self.text_iu_graph = self.iu_graph
 
-        self.model_mm = MM_Model(self.n_users, self.n_items, self.emb_dim, self.weight_size, self.mess_dropout, self.image_feats, self.text_feats, self.user_init_embedding, self.item_attribute_embedding)      
-        self.model_mm = self.model_mm.cuda()  
-        self.decoder = Decoder(self.user_init_embedding.shape[1]).cuda()
+        self.model_mm = MM_Model(self.n_users, self.n_items, self.emb_dim, self.weight_size, self.mess_dropout, self.image_feats, self.text_feats, self.user_init_embedding, self.item_attribute_embedding, device=device)
+        self.model_mm = self.model_mm.to(device)
+        self.decoder = Decoder(self.user_init_embedding.shape[1]).to(device)
 
 
         self.optimizer = optim.AdamW(
@@ -131,7 +161,7 @@ class Trainer(object):
         indices = torch.from_numpy(np.vstack((cur_matrix.row, cur_matrix.col)).astype(np.int64))  #
         values = torch.from_numpy(cur_matrix.data)  #
         shape = torch.Size(cur_matrix.shape)
-        return torch.sparse.FloatTensor(indices, values, shape).to(torch.float32).cuda()  #
+        return torch.sparse_coo_tensor(indices, values, shape, dtype=torch.float32, device=device, check_invariants=True).coalesce()  #
 
     def innerProduct(self, u_pos, i_pos, u_neg, j_neg):  
         pred_i = torch.sum(torch.mul(u_pos,i_pos), dim=-1) 
@@ -156,13 +186,10 @@ class Trainer(object):
         return feat_emb_loss
 
     def prune_loss(self, pred, drop_rate):
-        ind_sorted = np.argsort(pred.cpu().data).cuda()
-        loss_sorted = pred[ind_sorted]
-        remember_rate = 1 - drop_rate
-        num_remember = int(remember_rate * len(loss_sorted))
-        ind_update = ind_sorted[:num_remember]
-        loss_update = pred[ind_update]
-        return loss_update.mean()
+        # Preserve the original ordering while keeping sorting on the active device.
+        ind_sorted = torch.argsort(pred.detach())
+        num_remember = max(1, int((1 - drop_rate) * pred.numel()))
+        return pred[ind_sorted[:num_remember]].mean()
 
     def mse_criterion(self, x, y, alpha=3):
         x = F.normalize(x, p=2, dim=-1)
@@ -195,12 +222,15 @@ class Trainer(object):
         stopping_step = 0
 
         n_batch = data_generator.n_train // args.batch_size + 1
-        best_recall = 0
+        best_recall = -float("inf")
+        test_ret = None
         for epoch in range(args.epoch):
             t1 = time()
             loss, mf_loss, emb_loss, reg_loss = 0., 0., 0., 0.
             contrastive_loss = 0.
             n_batch = data_generator.n_train // args.batch_size + 1
+            if args.max_batches:
+                n_batch = min(n_batch, args.max_batches)
             sample_time = 0.
             build_item_graph = True
 
@@ -213,15 +243,11 @@ class Trainer(object):
                 users, pos_items, neg_items = data_generator.sample()
 
                 # augment samples 
-                augmented_sample_dict = pickle.load(open(args.data_path + args.dataset + '/augmented_sample_dict','rb'))
-                users_aug = random.sample(users, int(len(users)*args.aug_sample_rate))
-                pos_items_aug = [augmented_sample_dict[user][0] for user in users_aug if (augmented_sample_dict[user][0]<self.n_items and augmented_sample_dict[user][1]<self.n_items)]
-                neg_items_aug = [augmented_sample_dict[user][1] for user in users_aug if (augmented_sample_dict[user][0]<self.n_items and augmented_sample_dict[user][1]<self.n_items)]
-                users_aug = [user for user in users_aug if (augmented_sample_dict[user][0]<self.n_items and augmented_sample_dict[user][1]<self.n_items)]
-                self.new_batch_size = len(users_aug)
+                users_aug = random.sample(users, int(len(users) * args.aug_sample_rate))
+                users_aug = [user for user in users_aug if user in self.augmented_samples]
+                pos_items += [self.augmented_samples[user][0] for user in users_aug]
+                neg_items += [self.augmented_samples[user][1] for user in users_aug]
                 users += users_aug
-                pos_items += pos_items_aug
-                neg_items += neg_items_aug
 
 
                 sample_time += time() - sample_t1       
@@ -262,24 +288,23 @@ class Trainer(object):
                         input_i[value] = item_att_feats[value][i_mask_nodes]
                     decoded_u, decoded_i = self.decoder(torch.tensor(user_prof_feat[u_mask_nodes]), input_i)
                     if args.feat_loss_type=='mse':
-                        att_re_loss += self.mse_criterion(decoded_u, torch.tensor(self.user_init_embedding[u_mask_nodes]).cuda(), alpha=args.alpha_l)
+                        att_re_loss += self.mse_criterion(decoded_u, torch.tensor(self.user_init_embedding[u_mask_nodes]).to(device), alpha=args.alpha_l)
                         for index,value in enumerate(item_att_feats.keys()):  
-                            att_re_loss += self.mse_criterion(decoded_i[index], torch.tensor(self.item_attribute_embedding[value][i_mask_nodes]).cuda(), alpha=args.alpha_l)
+                            att_re_loss += self.mse_criterion(decoded_i[index], torch.tensor(self.item_attribute_embedding[value][i_mask_nodes]).to(device), alpha=args.alpha_l)
                     elif args.feat_loss_type=='sce':
-                        att_re_loss += self.sce_criterion(decoded_u, torch.tensor(self.user_init_embedding[u_mask_nodes]).cuda(), alpha=args.alpha_l) 
+                        att_re_loss += self.sce_criterion(decoded_u, torch.tensor(self.user_init_embedding[u_mask_nodes]).to(device), alpha=args.alpha_l)
                         for index,value in enumerate(item_att_feats.keys()):  
-                            att_re_loss += self.sce_criterion(decoded_i[index], torch.tensor(self.item_attribute_embedding[value][i_mask_nodes]).cuda(), alpha=args.alpha_l)
+                            att_re_loss += self.sce_criterion(decoded_i[index], torch.tensor(self.item_attribute_embedding[value][i_mask_nodes]).to(device), alpha=args.alpha_l)
 
                 batch_loss = batch_mf_loss + batch_emb_loss + batch_reg_loss + feat_emb_loss + args.aug_mf_rate*batch_mf_loss_aug + args.mm_mf_rate*mm_mf_loss + args.att_re_rate*att_re_loss
-                nn.utils.clip_grad_norm_(self.model_mm.parameters(), max_norm=1.0)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      #+ ssl_loss2 #+ batch_contrastive_loss
-                self.optimizer.zero_grad()  
-                batch_loss.backward(retain_graph=False)
-                
+                self.optimizer.zero_grad()
+                batch_loss.backward()
+                nn.utils.clip_grad_norm_(self.model_mm.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
-                loss += float(batch_loss)
-                mf_loss += float(batch_mf_loss)
-                emb_loss += float(batch_emb_loss)
+                loss += batch_loss.detach().item()
+                mf_loss += batch_mf_loss.detach().item()
+                emb_loss += batch_emb_loss.detach().item()
                 reg_loss += float(batch_reg_loss)
     
             del user_presentation_h, item_presentation_h, u_bpr_emb, i_bpr_neg_emb, i_bpr_pos_emb
@@ -288,40 +313,24 @@ class Trainer(object):
                 self.logger.logging('ERROR: loss is nan.')
                 sys.exit()
 
-            if (epoch + 1) % args.verbose != 0:
-                perf_str = 'Epoch %d [%.1fs]: train==[%.5f=%.5f + %.5f + %.5f  + %.5f]' % (
-                    epoch, time() - t1, loss, mf_loss, emb_loss, reg_loss, contrastive_loss)
-                training_time_list.append(time() - t1)
-                self.logger.logging(perf_str)
-
-            t2 = time()
-            users_to_test = list(data_generator.test_set.keys())
-            users_to_val = list(data_generator.val_set.keys())
-            ret = self.test(users_to_test, is_val=False)  #^-^
-            training_time_list.append(t2 - t1)
-
-            t3 = time()
-
-            if args.verbose > 0:
-                perf_str = 'Epoch %d [%.1fs + %.1fs]: train==[%.5f=%.5f + %.5f + %.5f], recall=[%.5f, %.5f, %.5f, %.5f], ' \
-                           'precision=[%.5f, %.5f, %.5f, %.5f], hit=[%.5f, %.5f, %.5f, %.5f], ndcg=[%.5f, %.5f, %.5f, %.5f]' % \
-                           (epoch, t2 - t1, t3 - t2, loss, mf_loss, emb_loss, reg_loss, ret['recall'][0], ret['recall'][1], ret['recall'][2],
-                            ret['recall'][-1],
-                            ret['precision'][0], ret['precision'][1], ret['precision'][2], ret['precision'][-1], ret['hit_ratio'][0], ret['hit_ratio'][1], ret['hit_ratio'][2], ret['hit_ratio'][-1],
-                            ret['ndcg'][0], ret['ndcg'][1], ret['ndcg'][2], ret['ndcg'][-1])
-                self.logger.logging(perf_str)
-
-            if ret['recall'][1] > best_recall:
-                best_recall = ret['recall'][1]
+            self.logger.logging(f'Epoch {epoch}: {n_batch} batches, loss={loss:.5f}, train_time={time() - t1:.1f}s')
+            users_to_test = list(data_generator.test_set)
+            users_to_val = list(data_generator.val_set)
+            if not users_to_val or not users_to_test:
+                raise ValueError('Nonempty validation and test sets are required')
+            ret = self.test(users_to_val, is_val=True)
+            self.logger.logging(f'Validation K={args.Ks}: {ret}')
+            metric_index = min(1, len(eval(args.Ks)) - 1)
+            if ret['recall'][metric_index] > best_recall:
+                best_recall = ret['recall'][metric_index]
                 test_ret = self.test(users_to_test, is_val=False)
-                self.logger.logging("Test_Recall@%d: %.5f,  precision=[%.5f], ndcg=[%.5f]" % (eval(args.Ks)[1], test_ret['recall'][1], test_ret['precision'][1], test_ret['ndcg'][1]))
+                self.logger.logging(f'Test at best validation: {test_ret}')
                 stopping_step = 0
-            elif stopping_step < args.early_stopping_patience:
-                stopping_step += 1
-                self.logger.logging('#####Early stopping steps: %d #####' % stopping_step)
             else:
-                self.logger.logging('#####Early stop! #####')
-                break
+                stopping_step += 1
+                if stopping_step >= args.early_stopping_patience:
+                    self.logger.logging('Early stop')
+                    break
         self.logger.logging(str(test_ret))
 
         return best_recall, run_time 
@@ -359,7 +368,6 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)  
 
 if __name__ == '__main__':
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
     set_seed(args.seed)
     config = dict()
     config['n_users'] = data_generator.n_users

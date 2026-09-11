@@ -6,6 +6,8 @@ class Logger():
         self.filename = filename
         self.path = path
         self.log_ = not is_debug
+        if self.log_:
+            os.makedirs(self.path, exist_ok=True)
     def logging(self, s):
         s = str(s)
         print(datetime.now().strftime('%Y-%m-%d %H:%M: '), s)

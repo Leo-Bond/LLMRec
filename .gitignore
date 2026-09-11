@@ -1,0 +1,17 @@
+# Datasets (large, keep local only)
+data/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Training logs
+logs/
+
+# macOS
+.DS_Store
+
+# IDE / local
+.codeflicker/
